@@ -55,13 +55,25 @@ def verify_password(password: str, hashed: str) -> bool:
     return hash_password(password) == hashed
 
 
+
+AUTH_CACHE = {}
+
 def key_match(role:str,team:str,passkey: str):
+    # Check cache first
+    if passkey in AUTH_CACHE:
+        cached = AUTH_CACHE[passkey]
+        if cached["role"] == role and cached["team"] == team:
+            return True
+            
     try:
-        if users_collection.find_one({"passkey": passkey,"role":role,"team":team}):
-            print("true")
+        user = users_collection.find_one({"passkey": passkey,"role":role,"team":team})
+        if user:
+            # Cache the successful result
+            AUTH_CACHE[passkey] = {"role": role, "team": team}
             return True
     except Exception as e:
         raise HTTPException(status_code=403, detail="Invalid credentials")
+
 
 
 
@@ -99,6 +111,11 @@ async def login(passkey:str):
     user = users_collection.find_one({"passkey": passkey})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid key")
+    
+    # Invalidate cache
+    if passkey in AUTH_CACHE:
+        del AUTH_CACHE[passkey]
+        
     users_collection.update_one({"passkey": passkey}, {"$set": {"passkey": "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/()[]", k=8))}})
     return {"message": "Logout successful"}
     
@@ -207,15 +224,13 @@ async def delete_user(id: str):
 
 @app.get("/events")
 async def get_events(x_user: Optional[str] = Header(None)):
-    print("called....")
     try:
-        user_info = json.loads(x_user) if x_user else None
-        if user_info and key_match(user_info["role"], user_info["team"], user_info["passkey"]):
-            all_events = list(events.find({}))
-            # Convert ObjectId to str
-            for event in all_events:
-                event["_id"] = str(event["_id"])
-            return {"events": all_events}
+        # Public access allowed, no auth check needed
+        all_events = list(events.find({}))
+        # Convert ObjectId to str
+        for event in all_events:
+            event["_id"] = str(event["_id"])
+        return {"events": all_events}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
