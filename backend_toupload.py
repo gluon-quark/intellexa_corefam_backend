@@ -1,14 +1,15 @@
 # main.py
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Body, Header
+import jwt
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Body, Header, Response, Cookie
 from fastapi.encoders import jsonable_encoder
-from typing import Optional
+from typing import Optional, List
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 import uvicorn
 from models import Event, QueryModel, LoginRequest
 from passlib.hash import bcrypt
 from bson import ObjectId
-from datetime import datetime
 from collections import defaultdict
 import base64
 import hashlib
@@ -16,6 +17,12 @@ import random
 import json
 
 app = FastAPI()
+
+# Security Constants
+SECRET_KEY = "your-very-secret-key-change-this-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,70 +61,115 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, hashed: str) -> bool:
     return hash_password(password) == hashed
 
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+def create_refresh_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-AUTH_CACHE = {}
-
-def key_match(role:str,team:str,passkey: str):
-    # Check cache first
-    if passkey in AUTH_CACHE:
-        cached = AUTH_CACHE[passkey]
-        if cached["role"] == role and cached["team"] == team:
-            return True
-            
+async def get_current_user(access_token: Optional[str] = Cookie(None)):
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        user = users_collection.find_one({"passkey": passkey,"role":role,"team":team})
-        if user:
-            # Cache the successful result
-            AUTH_CACHE[passkey] = {"role": role, "team": team}
-            return True
-    except Exception as e:
-        raise HTTPException(status_code=403, detail="Invalid credentials")
-
-
-
-
-@app.get("/")
-def home():
-    return {"message": "MongoDB connected successfully"}
+        payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = users_collection.find_one({"email": email})
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
 
 @app.post("/login")
-async def login(payload: LoginRequest):
+async def login(payload: LoginRequest, response: Response):
     email = payload.email
     password = payload.password
     user = users_collection.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid email")
-    else:
-        if not verify_password(password, user["password"]):
-            raise HTTPException(status_code=401, detail="Invalid password")
-        
-        if user["role"]=="Yet to be set" or user["team"]=="Yet to be set":
-            raise HTTPException(status_code=401, detail="Login not approved yet, contact admin to set role and team")
-        
-        passkey = "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/()[]", k=16))
-        users_collection.update_one({"email": email}, {"$set": {"passkey": passkey}})
     
-        return {"message": "Login successful", "user": {
+    if not user or not verify_password(password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if user["role"] == "Yet to be set" or user["team"] == "Yet to be set":
+        raise HTTPException(status_code=401, detail="Login not approved yet")
+    
+    access_token = create_access_token(data={"sub": user["email"]})
+    refresh_token = create_refresh_token(data={"sub": user["email"]})
+    
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+    
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600
+    )
+    
+    return {
+        "message": "Login successful",
+        "user": {
             "role": user["role"],
             "team": user["team"],
             "name": user["name"],
-            "passkey":  passkey
-        }}
-    
+            "email": user["email"]
+        }
+    }
+
+@app.post("/refresh")
+async def refresh(response: Response, refresh_token: Optional[str] = Cookie(None)):
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Refresh token missing")
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+            
+        new_access_token = create_access_token(data={"sub": email})
+        response.set_cookie(
+            key="access_token",
+            value=new_access_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        )
+        return {"message": "Token refreshed"}
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 @app.post("/logout")
-async def login(passkey:str):
-    user = users_collection.find_one({"passkey": passkey})
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid key")
-    
-    # Invalidate cache
-    if passkey in AUTH_CACHE:
-        del AUTH_CACHE[passkey]
-        
-    users_collection.update_one({"passkey": passkey}, {"$set": {"passkey": "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/()[]", k=8))}})
+async def logout(response: Response):
+    response.delete_cookie("access_token")
+    response.delete_cookie("refresh_token")
     return {"message": "Logout successful"}
+
+@app.get("/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return {
+        "role": user["role"],
+        "team": user["team"],
+        "name": user["name"],
+        "email": user["email"]
+    }
     
 
 @app.post("/createaccount")
@@ -170,130 +222,74 @@ def serialize_user(user):
 
 
 @app.get("/users")
-async def get_all_users(x_user: Optional[str] = Header(None)):
+async def get_all_users(user: dict = Depends(get_current_user)):
+    if user["role"] != "Admin":
+         raise HTTPException(status_code=403, detail="Not authorized")
+    
     try:
-        user_info = json.loads(x_user) if x_user else None
-        if user_info and key_match(user_info["role"], user_info["team"], user_info["passkey"]):
-
-            users = list(users_collection.find())
-            if not users:
-                raise HTTPException(status_code=404, detail="No users found")
-            serialized_users = [serialize_user(u) for u in users]
-            return {"total_users": len(serialized_users), "users": serialized_users}
+        users = list(users_collection.find())
+        return {"total_users": len(users), "users": [serialize_user(u) for u in users]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/user/{id}")
-async def update_user(id: str, data: dict = Body(...)):
-    """
-    Updates a user's role and team based on ID.
-    Example body: { "role": "Lead", "team": "Development" }
-    """
-    user = users_collection.find_one({"_id": ObjectId(id)})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+async def update_user(id: str, data: dict = Body(...), user: dict = Depends(get_current_user)):
+    if user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
 
     update_fields = {}
-    if "role" in data:
-        update_fields["role"] = data["role"]
-    if "team" in data:
-        update_fields["team"] = data["team"]
+    if "role" in data: update_fields["role"] = data["role"]
+    if "team" in data: update_fields["team"] = data["team"]
 
     if not update_fields:
-        raise HTTPException(status_code=400, detail="No valid fields provided")
+        raise HTTPException(status_code=400, detail="No valid fields")
 
     users_collection.update_one({"_id": ObjectId(id)}, {"$set": update_fields})
-
     updated_user = users_collection.find_one({"_id": ObjectId(id)})
-    return {"message": "User updated successfully", "user": serialize_user(updated_user)}
+    return {"message": "User updated", "user": serialize_user(updated_user)}
 
 
 @app.delete("/del/user/{id}")
-async def delete_user(id: str):
-    """
-    Deletes a user from the database based on ID.
-    """
+async def delete_user(id: str, user: dict = Depends(get_current_user)):
+    if user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
     result = users_collection.delete_one({"_id": ObjectId(id)})
-
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
-
     return {"message": f"User with ID {id} deleted successfully"}
 
 
 @app.get("/events")
-async def get_events(x_user: Optional[str] = Header(None)):
-    try:
-        # Public access allowed, no auth check needed
-        all_events = list(events.find({}))
-        # Convert ObjectId to str
-        for event in all_events:
-            event["_id"] = str(event["_id"])
-        return {"events": all_events}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_events():
+    all_events = list(events.find({}))
+    for event in all_events:
+        event["_id"] = str(event["_id"])
+    return {"events": all_events}
 
 @app.post("/add_event")
-def add_event(event: Event):
+def add_event(event: Event, user: dict = Depends(get_current_user)):
     result = events.insert_one(event.dict())
-    return {"message": "Event added successfully", "inserted_id": str(result.inserted_id)}
+    return {"message": "Event added", "inserted_id": str(result.inserted_id)}
 
 @app.put("/editevent/{id}")
-def update_event(id: str, updated_data: Event):
+def update_event(id: str, updated_data: Event, user: dict = Depends(get_current_user)):
     collection = db["events"]
-
-    # verify event exists
-    event = collection.find_one({"_id": ObjectId(id)})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    # remove None values (only update submitted fields)
-    update_dict = {
-        k: v
-        for k, v in updated_data.dict(exclude_unset=True).items()
-        if v not in (None, "")
-    }
-
-    if not update_dict:
-        raise HTTPException(status_code=400, detail="No valid fields provided for update")
-
-    result = collection.update_one(
-        {"_id": ObjectId(id)},
-        {"$set": jsonable_encoder(update_dict)},
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=400, detail="No changes made")
-
+    update_dict = {k: v for k, v in updated_data.dict(exclude_unset=True).items() if v not in (None, "")}
+    collection.update_one({"_id": ObjectId(id)}, {"$set": jsonable_encoder(update_dict)})
     updated_event = collection.find_one({"_id": ObjectId(id)})
     updated_event["_id"] = str(updated_event["_id"])
-
-    return {"message": "Event updated successfully", "data": updated_event}
+    return {"message": "Event updated", "data": updated_event}
 
 @app.put("/suggest/{id}")
-def suggest_event(id: str, data: dict = Body(...)):
+def suggest_event(id: str, data: dict = Body(...), user: dict = Depends(get_current_user)):
     suggestion = data.get("suggestion")
     if not suggestion:
         raise HTTPException(status_code=400, detail="Suggestion text required")
-
-    collection = db["events"]
-    event = collection.find_one({"_id": ObjectId(id)})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    # Reuse same update logic from /editevent
-    result = collection.update_one(
-        {"_id": ObjectId(id)},
-        {"$set": {"suggestion": suggestion}},
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=400, detail="No changes made")
-
-    updated_event = collection.find_one({"_id": ObjectId(id)})
+    db["events"].update_one({"_id": ObjectId(id)}, {"$set": {"suggestion": suggestion}})
+    updated_event = db["events"].find_one({"_id": ObjectId(id)})
     updated_event["_id"] = str(updated_event["_id"])
-    return {"message": "Suggestion added successfully", "data": updated_event}
+    return {"message": "Suggestion added", "data": updated_event}
 
 
 
@@ -322,21 +318,15 @@ async def submit_query(
     return {"message": "Query submitted successfully", "id": str(result.inserted_id)}
 
 @app.get("/queries")
-async def get_all_queries(x_user: Optional[str] = Header(None)):
-    try:
-        user_info = json.loads(x_user) if x_user else None
-        if user_info and key_match(user_info["role"], user_info["team"], user_info["passkey"]):
-
-            queries = list(queries_collection.find())
-            for q in queries:
-                q["_id"] = str(q["_id"])
-                if "created_at" in q and isinstance(q["created_at"], datetime):
-                    q["created_at"] = q["created_at"].isoformat()
-
-            return {"queries": queries}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_all_queries(user: dict = Depends(get_current_user)):
+    if user["role"] != "Admin":
+         raise HTTPException(status_code=403, detail="Not authorized")
+    queries = list(queries_collection.find())
+    for q in queries:
+        q["_id"] = str(q["_id"])
+        if "created_at" in q and isinstance(q["created_at"], datetime):
+            q["created_at"] = q["created_at"].isoformat()
+    return {"queries": queries}
 
 
 @app.put("/address_query/{query_id}")
@@ -378,34 +368,10 @@ async def get_team_stats(team_name: str):
     return {"team": team_name, "stats": team_data.get("stat", [])}
 
 @app.post("/stats/{team_name}/add")
-async def add_team_stat(team_name: str, data: dict = Body(...)):
-    """
-    Adds a new entry to the 'stat' array for the specified team.
-    Example body:
-    {
-        "month": "November",
-        "year": 2025,
-        "instagram": 1000,
-        "linkedin": 700,
-        "youtube": 500
-    }
-    """
-    team = stats_collection.find_one({"team": team_name})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found")
-
-    # Append the new stat entry
-    result = stats_collection.update_one(
-        {"team": team_name},
-        {"$push": {"stat": jsonable_encoder(data)}}
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=400, detail="Failed to update stats")
-
+async def add_team_stat(team_name: str, data: dict = Body(...), user: dict = Depends(get_current_user)):
+    stats_collection.update_one({"team": team_name}, {"$push": {"stat": jsonable_encoder(data)}})
     updated_team = stats_collection.find_one({"team": team_name})
-    updated_team["_id"] = str(updated_team["_id"])
-    return {"message": "Stat added successfully", "updated_data": updated_team}
+    return {"message": "Stat added", "updated_data": updated_team}
 
 
 @app.get("/events/count")
